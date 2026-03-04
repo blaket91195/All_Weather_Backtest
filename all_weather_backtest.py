@@ -279,8 +279,8 @@ def build_returns_df(prices, tickers):
         return pd.DataFrame(), []
     df = pd.concat(frames, axis=1)
     df.columns = available
-    # Ensure DatetimeIndex (tz-aware history data can cause issues)
-    df.index = pd.to_datetime(df.index).tz_localize(None)
+    # Ensure tz-naive DatetimeIndex (mixed tz from yf.Ticker().history())
+    df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
     df = df.sort_index().ffill()
     # Trim to common start
     df = df.dropna(how="any")
