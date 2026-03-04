@@ -125,51 +125,53 @@ def _output_has_rate_limit(text):
     return "ratelimit" in t or "429" in t or "toomany" in t
 
 
-def download_price(ticker, start="2005-01-01", end=None):
-    """Download adjusted close for a single ticker, with retry + backoff.
+def _batch_download(tickers, start, end):
+    """Download all tickers in a single yf.download call.
 
-    Captures yfinance's stdout/stderr to detect rate-limit messages that
-    yfinance handles internally (returning empty data instead of raising).
+    Returns (dict of {ticker: Series}, list of failed tickers, bool rate_limited).
     """
-    for attempt in range(MAX_ATTEMPTS):
-        try:
-            # Capture yfinance's printed output to detect silent rate limits
-            captured = io.StringIO()
-            with contextlib.redirect_stdout(captured), \
-                 contextlib.redirect_stderr(captured):
-                df = yf.download(ticker, start=start, end=end,
-                                 auto_adjust=True, progress=False)
-            yf_output = captured.getvalue()
+    captured = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured), \
+             contextlib.redirect_stderr(captured):
+            df = yf.download(tickers, start=start, end=end,
+                             auto_adjust=True, progress=False,
+                             group_by="ticker", threads=True)
+    except Exception as e:
+        print(f"  [error] Batch download failed: {type(e).__name__}: {e}")
+        return {}, tickers[:], _output_has_rate_limit(str(e))
 
-            if df is not None and not df.empty:
-                series = df["Close"].squeeze()
+    yf_output = captured.getvalue()
+    rate_limited = _output_has_rate_limit(yf_output)
+
+    prices = {}
+    failed = []
+
+    if df is None or df.empty:
+        return {}, tickers[:], rate_limited
+
+    for t in tickers:
+        try:
+            if len(tickers) == 1:
+                col = df["Close"]
+            else:
+                col = df[(t, "Close")] if (t, "Close") in df.columns else None
+            if col is not None and not col.dropna().empty:
+                series = col.dropna().squeeze()
                 if isinstance(series, pd.DataFrame):
                     series = series.iloc[:, 0]
-                series.name = ticker
-                return series
+                series.name = t
+                prices[t] = series
+            else:
+                failed.append(t)
+        except (KeyError, TypeError):
+            failed.append(t)
 
-            # Empty result — check if yfinance reported a rate limit
-            if _output_has_rate_limit(yf_output):
-                wait = RATE_LIMIT_WAIT * (attempt + 1)
-                print(f"\n    [rate-limited] {ticker} — cooling down {wait}s "
-                      f"(attempt {attempt+1}/{MAX_ATTEMPTS})")
-                time.sleep(wait)
-                continue
-
-            # Genuinely no data for this ticker
-            return None
-        except Exception as e:
-            wait = RATE_LIMIT_WAIT * (attempt + 1)
-            print(f"\n    [error] {ticker}: {type(e).__name__} — retry in "
-                  f"{wait}s (attempt {attempt+1}/{MAX_ATTEMPTS})")
-            time.sleep(wait)
-    print(f"\n    [FAILED] {ticker} after {MAX_ATTEMPTS} attempts")
-    return None
+    return prices, failed, rate_limited
 
 
 def download_all_prices(tickers, start="2005-01-01", end=None):
-    """Download prices one ticker at a time with rate-limit protection."""
-    prices = {}
+    """Download prices using batch yf.download with retry on rate limits."""
     proxy_log = {}
     unique_tickers = sorted(set(tickers))
 
@@ -178,37 +180,39 @@ def download_all_prices(tickers, start="2005-01-01", end=None):
     all_to_download = sorted(set(unique_tickers) | proxies_needed)
 
     total = len(all_to_download)
-    print(f"Downloading data for {total} tickers ({DOWNLOAD_DELAY}s between calls)...")
-    failed_tickers = []
+    print(f"Downloading data for {total} tickers in batch mode...")
 
-    for i, t in enumerate(all_to_download, 1):
-        print(f"  [{i}/{total}] {t}...", end=" ", flush=True)
-        s = download_price(t, start=start, end=end)
-        if s is not None:
-            prices[t] = s
-            print(f"OK ({len(s)} days)")
+    prices, failed, rate_limited = _batch_download(all_to_download, start, end)
+
+    ok_count = len(prices)
+    print(f"  Batch result: {ok_count}/{total} succeeded")
+    for t in sorted(prices):
+        print(f"    {t}: {len(prices[t])} days")
+
+    # Retry failed tickers (may be rate-limited or genuinely missing)
+    retry_round = 0
+    while failed and retry_round < MAX_ATTEMPTS:
+        retry_round += 1
+        if rate_limited:
+            wait = RATE_LIMIT_WAIT * retry_round
+            print(f"\n  Rate-limited — waiting {wait}s before retry "
+                  f"{retry_round}/{MAX_ATTEMPTS}...")
+            time.sleep(wait)
         else:
-            print("FAILED")
-            failed_tickers.append(t)
-        # Delay between tickers to stay under rate limits
-        if i < total:
-            time.sleep(DOWNLOAD_DELAY)
+            # Not rate-limited; remaining tickers probably have no data
+            print(f"\n  No data for: {', '.join(failed)}")
+            break
 
-    # Second pass: retry any that failed, with longer delays
-    if failed_tickers:
-        print(f"\nRetrying {len(failed_tickers)} failed tickers "
-              f"(with {RATE_LIMIT_WAIT}s delays)...")
-        time.sleep(RATE_LIMIT_WAIT)
-        for i, t in enumerate(failed_tickers, 1):
-            print(f"  [retry {i}/{len(failed_tickers)}] {t}...", end=" ",
-                  flush=True)
-            s = download_price(t, start=start, end=end)
-            if s is not None:
-                prices[t] = s
-                print(f"OK ({len(s)} days)")
-            else:
-                print("FAILED")
-            time.sleep(RATE_LIMIT_WAIT)
+        print(f"  Retrying {len(failed)} tickers (batch)...")
+        new_prices, still_failed, rate_limited = _batch_download(
+            failed, start, end)
+        prices.update(new_prices)
+        if new_prices:
+            print(f"    Recovered: {', '.join(sorted(new_prices))}")
+        failed = still_failed
+
+    if failed:
+        print(f"  No data for: {', '.join(failed)}")
 
     # Proxy backfill: extend ASX ETF history with US equivalent
     for asx_ticker, us_proxy in PROXY_MAP.items():
