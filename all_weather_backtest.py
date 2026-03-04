@@ -8,9 +8,11 @@ backtest with periodic rebalancing, and outputs performance metrics + charts.
 """
 
 import os
+import io
 import time
 import datetime
 import warnings
+import contextlib
 
 import numpy as np
 import pandas as pd
@@ -117,46 +119,51 @@ def ticker_to_sleeve(ticker):
     return "Other"
 
 
-def _is_rate_limit_error(exc):
-    """Check if an exception is a Yahoo Finance rate limit error."""
-    name = type(exc).__name__.lower()
-    msg = str(exc).lower()
-    combined = name + " " + msg
-    return any(kw in combined for kw in ["ratelimit", "rate limit", "429",
-                                          "too many requests"])
+def _output_has_rate_limit(text):
+    """Check if captured yfinance output contains rate-limit messages."""
+    t = text.lower().replace(" ", "")
+    return "ratelimit" in t or "429" in t or "toomany" in t
 
 
 def download_price(ticker, start="2005-01-01", end=None):
     """Download adjusted close for a single ticker, with retry + backoff.
 
-    Uses raise_errors=True so yfinance surfaces rate-limit errors as
-    exceptions instead of silently returning empty DataFrames.
+    Captures yfinance's stdout/stderr to detect rate-limit messages that
+    yfinance handles internally (returning empty data instead of raising).
     """
     for attempt in range(MAX_ATTEMPTS):
         try:
-            # raise_errors=True makes yfinance raise YFRateLimitError
-            # instead of silently returning empty data
-            df = yf.download(ticker, start=start, end=end, auto_adjust=True,
-                             progress=False, raise_errors=True)
+            # Capture yfinance's printed output to detect silent rate limits
+            captured = io.StringIO()
+            with contextlib.redirect_stdout(captured), \
+                 contextlib.redirect_stderr(captured):
+                df = yf.download(ticker, start=start, end=end,
+                                 auto_adjust=True, progress=False)
+            yf_output = captured.getvalue()
+
             if df is not None and not df.empty:
                 series = df["Close"].squeeze()
                 if isinstance(series, pd.DataFrame):
                     series = series.iloc[:, 0]
                 series.name = ticker
                 return series
+
+            # Empty result — check if yfinance reported a rate limit
+            if _output_has_rate_limit(yf_output):
+                wait = RATE_LIMIT_WAIT * (attempt + 1)
+                print(f"\n    [rate-limited] {ticker} — cooling down {wait}s "
+                      f"(attempt {attempt+1}/{MAX_ATTEMPTS})")
+                time.sleep(wait)
+                continue
+
             # Genuinely no data for this ticker
             return None
         except Exception as e:
-            if _is_rate_limit_error(e):
-                wait = RATE_LIMIT_WAIT * (attempt + 1)
-                print(f"    [rate-limited] {ticker} — cooling down {wait}s "
-                      f"(attempt {attempt+1}/{MAX_ATTEMPTS})")
-            else:
-                wait = 3 * (attempt + 1)
-                print(f"    [error] {ticker}: {type(e).__name__} — retry in {wait}s "
-                      f"(attempt {attempt+1}/{MAX_ATTEMPTS})")
+            wait = RATE_LIMIT_WAIT * (attempt + 1)
+            print(f"\n    [error] {ticker}: {type(e).__name__} — retry in "
+                  f"{wait}s (attempt {attempt+1}/{MAX_ATTEMPTS})")
             time.sleep(wait)
-    print(f"    [FAILED] {ticker} after {MAX_ATTEMPTS} attempts")
+    print(f"\n    [FAILED] {ticker} after {MAX_ATTEMPTS} attempts")
     return None
 
 
