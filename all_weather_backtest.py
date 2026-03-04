@@ -34,9 +34,9 @@ TRANSACTION_COST_BPS = 0  # basis points per trade (0 = no cost)
 START_DATE = None  # None = as far back as data allows
 END_DATE = None  # None = latest available
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
-DOWNLOAD_DELAY = 1.5  # seconds between yfinance calls (increase if rate-limited)
-BATCH_SIZE = 5  # download tickers in small batches to avoid rate limits
-BATCH_PAUSE = 8  # seconds to pause between batches
+DOWNLOAD_DELAY = 2.0   # seconds between successful yfinance calls
+RATE_LIMIT_WAIT = 15   # base seconds to wait when rate-limited (multiplied by attempt)
+MAX_ATTEMPTS = 5       # max retries per ticker
 
 # ---------------------------------------------------------------------------
 # Portfolio sleeve definitions
@@ -117,67 +117,51 @@ def ticker_to_sleeve(ticker):
     return "Other"
 
 
+def _is_rate_limit_error(exc):
+    """Check if an exception is a Yahoo Finance rate limit error."""
+    name = type(exc).__name__.lower()
+    msg = str(exc).lower()
+    combined = name + " " + msg
+    return any(kw in combined for kw in ["ratelimit", "rate limit", "429",
+                                          "too many requests"])
+
+
 def download_price(ticker, start="2005-01-01", end=None):
-    """Download adjusted close for a single ticker, with retry + backoff."""
-    max_attempts = 5
-    for attempt in range(max_attempts):
+    """Download adjusted close for a single ticker, with retry + backoff.
+
+    Uses raise_errors=True so yfinance surfaces rate-limit errors as
+    exceptions instead of silently returning empty DataFrames.
+    """
+    for attempt in range(MAX_ATTEMPTS):
         try:
+            # raise_errors=True makes yfinance raise YFRateLimitError
+            # instead of silently returning empty data
             df = yf.download(ticker, start=start, end=end, auto_adjust=True,
-                             progress=False)
+                             progress=False, raise_errors=True)
             if df is not None and not df.empty:
                 series = df["Close"].squeeze()
                 if isinstance(series, pd.DataFrame):
                     series = series.iloc[:, 0]
                 series.name = ticker
                 return series
-            # Empty result — ticker may not exist, no point retrying
-            if attempt == 0:
-                print(f"  [warn] {ticker}: no data returned")
+            # Genuinely no data for this ticker
             return None
         except Exception as e:
-            err_str = str(e).lower()
-            is_rate_limit = "rate" in err_str or "429" in err_str or "too many" in err_str
-            wait = (2 ** (attempt + 1)) + (3 if is_rate_limit else 0)
-            if is_rate_limit:
-                print(f"  [rate-limited] {ticker} — waiting {wait}s "
-                      f"(attempt {attempt+1}/{max_attempts})")
+            if _is_rate_limit_error(e):
+                wait = RATE_LIMIT_WAIT * (attempt + 1)
+                print(f"    [rate-limited] {ticker} — cooling down {wait}s "
+                      f"(attempt {attempt+1}/{MAX_ATTEMPTS})")
             else:
-                print(f"  [warn] {ticker} attempt {attempt+1}/{max_attempts}: {e}")
+                wait = 3 * (attempt + 1)
+                print(f"    [error] {ticker}: {type(e).__name__} — retry in {wait}s "
+                      f"(attempt {attempt+1}/{MAX_ATTEMPTS})")
             time.sleep(wait)
-    print(f"  [ERROR] Could not download {ticker} after {max_attempts} attempts")
+    print(f"    [FAILED] {ticker} after {MAX_ATTEMPTS} attempts")
     return None
 
 
-def _download_batch(tickers_batch, start, end):
-    """Download a batch of tickers at once using yf.download multi-ticker."""
-    results = {}
-    try:
-        df = yf.download(tickers_batch, start=start, end=end,
-                         auto_adjust=True, progress=False,
-                         group_by="ticker", threads=False)
-        if df is None or df.empty:
-            return results
-        for ticker in tickers_batch:
-            try:
-                if len(tickers_batch) == 1:
-                    col = df["Close"].squeeze()
-                else:
-                    col = df[(ticker, "Close")].squeeze()
-                if isinstance(col, pd.DataFrame):
-                    col = col.iloc[:, 0]
-                col = col.dropna()
-                if len(col) > 0:
-                    col.name = ticker
-                    results[ticker] = col
-            except (KeyError, TypeError):
-                pass
-    except Exception:
-        pass
-    return results
-
-
 def download_all_prices(tickers, start="2005-01-01", end=None):
-    """Download prices for a list of tickers, applying proxy backfill."""
+    """Download prices one ticker at a time with rate-limit protection."""
     prices = {}
     proxy_log = {}
     unique_tickers = sorted(set(tickers))
@@ -187,35 +171,37 @@ def download_all_prices(tickers, start="2005-01-01", end=None):
     all_to_download = sorted(set(unique_tickers) | proxies_needed)
 
     total = len(all_to_download)
-    print(f"Downloading data for {total} tickers "
-          f"(in batches of {BATCH_SIZE}, {BATCH_PAUSE}s between batches)...")
+    print(f"Downloading data for {total} tickers ({DOWNLOAD_DELAY}s between calls)...")
+    failed_tickers = []
 
-    # Download in small batches to avoid rate limits
-    for batch_start in range(0, total, BATCH_SIZE):
-        batch = all_to_download[batch_start:batch_start + BATCH_SIZE]
-        batch_num = batch_start // BATCH_SIZE + 1
-        total_batches = (total + BATCH_SIZE - 1) // BATCH_SIZE
-        print(f"  Batch {batch_num}/{total_batches}: {', '.join(batch)}")
+    for i, t in enumerate(all_to_download, 1):
+        print(f"  [{i}/{total}] {t}...", end=" ", flush=True)
+        s = download_price(t, start=start, end=end)
+        if s is not None:
+            prices[t] = s
+            print(f"OK ({len(s)} days)")
+        else:
+            print("FAILED")
+            failed_tickers.append(t)
+        # Delay between tickers to stay under rate limits
+        if i < total:
+            time.sleep(DOWNLOAD_DELAY)
 
-        # Try batch download first
-        batch_results = _download_batch(batch, start, end)
-        prices.update(batch_results)
-
-        # Individually retry any that failed in the batch
-        failed = [t for t in batch if t not in batch_results]
-        if failed:
-            print(f"  Retrying individually: {', '.join(failed)}")
-            time.sleep(DOWNLOAD_DELAY * 2)
-            for t in failed:
-                s = download_price(t, start=start, end=end)
-                if s is not None:
-                    prices[t] = s
-                time.sleep(DOWNLOAD_DELAY)
-
-        # Pause between batches to avoid rate limits
-        if batch_start + BATCH_SIZE < total:
-            print(f"  Pausing {BATCH_PAUSE}s to avoid rate limits...")
-            time.sleep(BATCH_PAUSE)
+    # Second pass: retry any that failed, with longer delays
+    if failed_tickers:
+        print(f"\nRetrying {len(failed_tickers)} failed tickers "
+              f"(with {RATE_LIMIT_WAIT}s delays)...")
+        time.sleep(RATE_LIMIT_WAIT)
+        for i, t in enumerate(failed_tickers, 1):
+            print(f"  [retry {i}/{len(failed_tickers)}] {t}...", end=" ",
+                  flush=True)
+            s = download_price(t, start=start, end=end)
+            if s is not None:
+                prices[t] = s
+                print(f"OK ({len(s)} days)")
+            else:
+                print("FAILED")
+            time.sleep(RATE_LIMIT_WAIT)
 
     # Proxy backfill: extend ASX ETF history with US equivalent
     for asx_ticker, us_proxy in PROXY_MAP.items():
