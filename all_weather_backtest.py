@@ -147,6 +147,9 @@ def _download_single(ticker, start, end):
         if isinstance(series, pd.DataFrame):
             series = series.iloc[:, 0]
         series.name = ticker
+        # Normalize to tz-naive dates to avoid cross-exchange timezone
+        # alignment issues (ASX vs US timestamps differ after UTC conversion)
+        series.index = pd.to_datetime(series.index.date)
         return series, yf_output
     return None, yf_output
 
@@ -279,8 +282,8 @@ def build_returns_df(prices, tickers):
         return pd.DataFrame(), []
     df = pd.concat(frames, axis=1)
     df.columns = available
-    # Ensure tz-naive DatetimeIndex (mixed tz from yf.Ticker().history())
-    df.index = pd.to_datetime(df.index, utc=True).tz_localize(None)
+    # Ensure clean DatetimeIndex (already tz-naive from _download_single)
+    df.index = pd.to_datetime(df.index)
     df = df.sort_index().ffill()
     # Trim to common start
     df = df.dropna(how="any")
