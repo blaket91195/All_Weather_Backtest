@@ -48,9 +48,8 @@ MAX_ATTEMPTS = 5       # max retries per ticker
 SLEEVE_ALLOCATIONS = {
     "Long-Term Bonds":      {"tickers": {"GGOV.AX": 1.0}, "weight": 0.40},
     "Intermediate Bonds":   {"tickers": {"US10.AX": 1.0}, "weight": 0.15},
-    "Broad Commodities":    {"tickers": {"BCOM.AX": 1.0}, "weight": 0.065},
-    "Gold":                 {"tickers": {"GOLD.AX": 1.0}, "weight": 0.065},
-    "Bitcoin":              {"tickers": {"BTC-AUD": 1.0}, "weight": 0.02},
+    "Broad Commodities":    {"tickers": {"BCOM.AX": 1.0}, "weight": 0.075},
+    "Gold":                 {"tickers": {"PMGOLD.AX": 1.0}, "weight": 0.075},
 }
 
 # Equity sleeve (30% of total)
@@ -70,7 +69,7 @@ PROXY_MAP = {
     "GGOV.AX": "TLT",
     "US10.AX": "IEF",
     "BCOM.AX": "DBC",
-    "GOLD.AX": "GLD",
+    "PMGOLD.AX": "GLD",
 }
 
 # Benchmarks
@@ -508,7 +507,7 @@ def chart_sleeve_contribution(sleeve_values, filename="sleeve_contribution.png")
 
     fig, ax = plt.subplots(figsize=(14, 7))
     sleeve_order = ["Long-Term Bonds", "Intermediate Bonds",
-                    "Broad Commodities", "Gold", "Bitcoin", "Stocks"]
+                    "Broad Commodities", "Gold", "Stocks"]
     ordered_cols = [c for c in sleeve_order if c in grouped.columns]
     remaining = [c for c in grouped.columns if c not in ordered_cols]
     ordered_cols += remaining
