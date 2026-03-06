@@ -70,6 +70,7 @@ PROXY_MAP = {
     "US10.AX": "IEF",
     "BCOM.AX": "DBC",
     "PMGOLD.AX": "GLD",
+    "GOLD.AX": "GLD",
 }
 
 # Benchmarks
@@ -77,7 +78,7 @@ BENCHMARKS = {
     "ASX 200": {"STW.AX": 1.0},
     "S&P 500": {"SPY": 1.0},
     "Classic 60/40": {"STW.AX": 0.60, "GGOV.AX": 0.40},
-    "All Weather (VAS)": None,  # built dynamically below
+    "Classic All Weather": None,  # built dynamically below
 }
 
 
@@ -85,14 +86,16 @@ BENCHMARKS = {
 # HELPER FUNCTIONS
 # ============================================================================
 
-def build_all_weather_vas():
-    """Build the pure All Weather variant that replaces equities with VAS."""
-    alloc = {}
-    for sleeve in SLEEVE_ALLOCATIONS.values():
-        for t, w in sleeve["tickers"].items():
-            alloc[t] = sleeve["weight"] * w
-    alloc["VAS.AX"] = EQUITY_WEIGHT
-    return alloc
+def build_classic_all_weather():
+    """Build the classic All Weather with BTC, original gold, and VAS for stocks."""
+    return {
+        "VAS.AX":    0.30,   # Stocks
+        "GGOV.AX":   0.40,   # Long-term bonds
+        "US10.AX":   0.15,   # Intermediate bonds
+        "BCOM.AX":   0.065,  # Commodities
+        "GOLD.AX":   0.065,  # Gold (original ETF)
+        "BTC-AUD":   0.02,   # Bitcoin
+    }
 
 
 def build_target_weights():
@@ -623,13 +626,13 @@ def main():
 
     # Build target weights
     aw_weights = build_target_weights()
-    vas_weights = build_all_weather_vas()
+    classic_aw_weights = build_classic_all_weather()
 
     # Collect all tickers we need
     all_tickers = set(aw_weights.keys())
     all_tickers.add("STW.AX")   # ASX 200 benchmark
     all_tickers.add("SPY")      # S&P 500 benchmark
-    all_tickers.add("VAS.AX")   # Pure All Weather benchmark
+    all_tickers.update(classic_aw_weights.keys())  # Classic All Weather benchmark
     for bm_tickers in BENCHMARKS.values():
         if bm_tickers:
             all_tickers.update(bm_tickers.keys())
@@ -706,16 +709,16 @@ def main():
                                      STARTING_CAPITAL, REBALANCE_FREQ)
             results["Classic 60/40"] = bm_val
 
-    # All Weather (VAS)
-    print("Running All Weather (VAS) benchmark...")
-    vas_tickers = list(vas_weights.keys())
-    bm_returns, bm_avail = build_returns_df(prices, vas_tickers)
+    # Classic All Weather
+    print("Running Classic All Weather benchmark...")
+    classic_tickers = list(classic_aw_weights.keys())
+    bm_returns, bm_avail = build_returns_df(prices, classic_tickers)
     if not bm_returns.empty:
         bm_ret_aligned = bm_returns.reindex(date_range).dropna()
         if not bm_ret_aligned.empty:
-            bm_val, _ = run_backtest(bm_ret_aligned, vas_weights,
+            bm_val, _ = run_backtest(bm_ret_aligned, classic_aw_weights,
                                      STARTING_CAPITAL, REBALANCE_FREQ)
-            results["All Weather (VAS)"] = bm_val
+            results["Classic All Weather"] = bm_val
 
     # Align all results to a common date range
     common_start = max(pv.index[0] for pv in results.values())
